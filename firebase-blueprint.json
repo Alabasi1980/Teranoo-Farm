@@ -1,0 +1,81 @@
+{
+  "entities": {
+    "Farm": {
+      "title": "Farm",
+      "description": "Single-player farm save state owned by one authenticated Google user.",
+      "type": "object",
+      "properties": {
+        "schemaVersion": {
+          "type": "integer",
+          "description": "Schema version of the save document (currently 1)."
+        },
+        "revision": {
+          "type": "integer",
+          "description": "Monotonically increasing revision counter for optimistic concurrency control."
+        },
+        "ownerUid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Firebase Auth UID of the farm owner."
+        },
+        "coins": {
+          "type": "integer",
+          "description": "Non-negative currency balance."
+        },
+        "xp": {
+          "type": "integer",
+          "description": "Non-negative total experience points."
+        },
+        "seeds": {
+          "type": "object",
+          "description": "Map of cropId to non-negative seed counts (wheat, carrot)."
+        },
+        "crops": {
+          "type": "object",
+          "description": "Map of cropId to non-negative harvested crop counts (wheat, carrot)."
+        },
+        "plots": {
+          "type": "array",
+          "description": "Fixed array of 6 farm plots with cropId, plantedAt, and wateredAt timestamps."
+        },
+        "stats": {
+          "type": "object",
+          "description": "Cumulative counters: totalPlanted, totalHarvested, totalRevenue, rescueGrants."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when the farm was first created."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp of the latest confirmed save."
+        }
+      },
+      "required": [
+        "schemaVersion",
+        "revision",
+        "ownerUid",
+        "coins",
+        "xp",
+        "seeds",
+        "crops",
+        "plots",
+        "stats",
+        "createdAt",
+        "updatedAt"
+      ]
+    }
+  },
+  "firestore": {
+    "/farms/{userId}": {
+      "schema": {
+        "$ref": "#/entities/Farm"
+      },
+      "description": "Per-user isolated farm save document keyed by Firebase Auth UID."
+    }
+  }
+}

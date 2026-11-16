@@ -1,0 +1,6 @@
+{
+  "name": "مزرعتي — رحلة الازدهار",
+  "description": "لعبة مزرعة ثلاثية الأبعاد بواجهة عربية RTL، مع دورة زراعة متكاملة وحفظ سحابي عبر Firebase.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
