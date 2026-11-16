@@ -7,8 +7,127 @@ service cloud.firestore {
       allow read, write: if false;
     }
 
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isValidId(id) {
+      return id is string
+        && id.size() >= 1
+        && id.size() <= 128
+        && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function isOwner(userId) {
+      return isSignedIn()
+        && request.auth.token.email_verified == true
+        && request.auth.uid == userId;
+    }
+
+    function isNonNegInt(val) {
+      return val is int && val >= 0;
+    }
+
+    function isValidResourceMap(mapVal) {
+      return mapVal is map
+        && mapVal.keys().hasAll(['wheat', 'carrot'])
+        && mapVal.keys().hasOnly(['wheat', 'carrot'])
+        && isNonNegInt(mapVal.wheat)
+        && isNonNegInt(mapVal.carrot);
+    }
+
+    function isValidStatsMap(statsVal) {
+      return statsVal is map
+        && statsVal.keys().hasAll(['totalPlanted', 'totalHarvested', 'totalRevenue', 'rescueGrants'])
+        && statsVal.keys().hasOnly(['totalPlanted', 'totalHarvested', 'totalRevenue', 'rescueGrants'])
+        && isNonNegInt(statsVal.totalPlanted)
+        && isNonNegInt(statsVal.totalHarvested)
+        && isNonNegInt(statsVal.totalRevenue)
+        && isNonNegInt(statsVal.rescueGrants);
+    }
+
+    function isValidPlot(plot, expectedId) {
+      return plot is map
+        && plot.keys().hasAll(['id', 'cropId', 'plantedAt', 'wateredAt'])
+        && plot.keys().hasOnly(['id', 'cropId', 'plantedAt', 'wateredAt'])
+        && plot.id is string
+        && plot.id.size() <= 16
+        && plot.id == expectedId
+        && plot.cropId is string
+        && plot.cropId.size() <= 16
+        && (plot.cropId in ['', 'wheat', 'carrot'])
+        && isNonNegInt(plot.plantedAt)
+        && isNonNegInt(plot.wateredAt)
+        && (
+          (plot.cropId == '' && plot.plantedAt == 0 && plot.wateredAt == 0) ||
+          (plot.cropId != '' && plot.plantedAt > 0 && (plot.wateredAt == 0 || plot.wateredAt >= plot.plantedAt))
+        );
+    }
+
+    function isValidFarm(data, userId) {
+      return data.keys().hasAll([
+          'schemaVersion', 'revision', 'ownerUid', 'coins', 'xp',
+          'seeds', 'crops', 'plots', 'stats', 'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'schemaVersion', 'revision', 'ownerUid', 'coins', 'xp',
+          'seeds', 'crops', 'plots', 'stats', 'createdAt', 'updatedAt'
+        ])
+        && data.schemaVersion is int
+        && data.schemaVersion == 1
+        && data.revision is int
+        && data.revision >= 1
+        && isValidId(data.ownerUid)
+        && data.ownerUid == userId
+        && isNonNegInt(data.coins)
+        && isNonNegInt(data.xp)
+        && isValidResourceMap(data.seeds)
+        && isValidResourceMap(data.crops)
+        && isValidStatsMap(data.stats)
+        && data.plots is list
+        && data.plots.size() == 6
+        && isValidPlot(data.plots[0], 'plot-1')
+        && isValidPlot(data.plots[1], 'plot-2')
+        && isValidPlot(data.plots[2], 'plot-3')
+        && isValidPlot(data.plots[3], 'plot-4')
+        && isValidPlot(data.plots[4], 'plot-5')
+        && isValidPlot(data.plots[5], 'plot-6')
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
     match /farms/{userId} {
-      allow read, write: if request.auth != null && request.auth.uid == userId;
+      allow get: if isOwner(userId) && isValidId(userId);
+      allow list: if false;
+
+      allow create: if isOwner(userId)
+        && isValidId(userId)
+        && isValidFarm(incoming(), userId)
+        && incoming().revision == 1
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+
+      allow update: if isOwner(userId)
+        && isValidId(userId)
+        && isValidFarm(incoming(), userId)
+        && incoming().diff(existing()).affectedKeys().hasOnly([
+          'schemaVersion', 'revision', 'ownerUid', 'coins', 'xp', 'seeds', 'crops', 'plots', 'stats', 'updatedAt'
+        ])
+        && incoming().ownerUid == existing().ownerUid
+        && incoming().schemaVersion == existing().schemaVersion
+        && incoming().createdAt == existing().createdAt
+        && incoming().revision == existing().revision + 1
+        && incoming().updatedAt == request.time;
+
+      allow delete: if false;
     }
   }
 }

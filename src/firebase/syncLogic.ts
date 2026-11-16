@@ -7,6 +7,27 @@ export interface PendingLocalSnapshot {
   baseRevision: number;
   state: FarmState;
   queuedAtMs: number;
+  seq?: number;
+}
+
+export class OwnerMismatchError extends Error {
+  public readonly expectedUid: string;
+  public readonly actualOwnerUid: string;
+
+  constructor(expectedUid: string, actualOwnerUid: string) {
+    super(
+      `Owner UID mismatch before cloud write: expected "${expectedUid}", got "${actualOwnerUid}"`,
+    );
+    this.name = 'OwnerMismatchError';
+    this.expectedUid = expectedUid;
+    this.actualOwnerUid = actualOwnerUid;
+  }
+}
+
+export function assertOwnerUidMatch(state: FarmState, uid: string): void {
+  if (!uid || state.ownerUid !== uid) {
+    throw new OwnerMismatchError(uid, state.ownerUid);
+  }
 }
 
 export class RevisionConflictError extends Error {
@@ -25,7 +46,7 @@ export class RevisionConflictError extends Error {
 
 export type LoadResolution =
   | { kind: 'use_server'; state: FarmState }
-  | { kind: 'retry_pending'; state: FarmState; baseRevision: number }
+  | { kind: 'retry_pending'; state: FarmState; baseRevision: number; pendingSeq?: number }
   | { kind: 'conflict'; serverState: FarmState; pendingState: FarmState }
   | { kind: 'create_initial' };
 
@@ -134,7 +155,12 @@ export function resolveLoadState(
     return { kind: 'create_initial' };
   }
 
-  if (!pendingLocal || pendingLocal.uid !== serverState.ownerUid) {
+  if (
+    !pendingLocal ||
+    pendingLocal.uid !== serverState.ownerUid ||
+    pendingLocal.state.ownerUid !== serverState.ownerUid ||
+    pendingLocal.state.ownerUid === 'local-preview'
+  ) {
     return { kind: 'use_server', state: serverState };
   }
 
@@ -145,6 +171,7 @@ export function resolveLoadState(
       kind: 'retry_pending',
       state: pendingLocal.state,
       baseRevision: pendingLocal.baseRevision,
+      pendingSeq: typeof pendingLocal.seq === 'number' ? pendingLocal.seq : 1,
     };
   }
 

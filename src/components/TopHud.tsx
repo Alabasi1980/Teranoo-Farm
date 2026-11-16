@@ -18,6 +18,9 @@ interface TopHudProps {
   farmState: FarmState;
   saveStatus: SaveStatus;
   isLocalPreview: boolean;
+  isResetting?: boolean;
+  localPersistFailed?: boolean;
+  hasConflict?: boolean;
   userEmail: string | null;
   muted: boolean;
   lastSavedAtMs: number | null;
@@ -28,7 +31,10 @@ interface TopHudProps {
   onSignOut: () => void;
 }
 
-function renderSaveStatusLabel(status: SaveStatus): {
+function renderSaveStatusLabel(
+  status: SaveStatus,
+  localPersistFailed = false,
+): {
   label: string;
   tone: string;
   icon: 'saved' | 'saving' | 'offline' | 'error';
@@ -52,7 +58,7 @@ function renderSaveStatusLabel(status: SaveStatus): {
       };
     case 'error':
       return {
-        label: 'تعذر الحفظ',
+        label: localPersistFailed ? 'تعذر الحفظ المحلي والسحابي' : 'تعذر الحفظ',
         tone: 'bg-[#fee2e2] text-[#991b1b] border-[#f87171]',
         icon: 'error',
       };
@@ -73,6 +79,9 @@ export function TopHud({
   farmState,
   saveStatus,
   isLocalPreview,
+  isResetting = false,
+  localPersistFailed = false,
+  hasConflict = false,
   userEmail,
   muted,
   lastSavedAtMs,
@@ -84,7 +93,7 @@ export function TopHud({
 }: TopHudProps) {
   const levelInfo = computeLevelFromXp(farmState.xp);
   const goal = getIntroGoalProgress(farmState);
-  const statusUi = renderSaveStatusLabel(saveStatus);
+  const statusUi = renderSaveStatusLabel(saveStatus, localPersistFailed);
 
   return (
     <div className="pointer-events-none fixed inset-x-0 top-0 z-20 flex flex-wrap items-start justify-between gap-2 p-2.5 sm:p-4">
@@ -203,9 +212,10 @@ export function TopHud({
         <button
           type="button"
           onClick={onRequestNewFarm}
-          className="cursor-pointer rounded-xl border-2 border-[#c27d58] bg-[#fff5eb]/95 px-2.5 py-1.5 text-xs font-extrabold text-[#7c2d12] shadow-md hover:bg-[#ffedd5]"
+          disabled={isResetting || hasConflict}
+          className="cursor-pointer rounded-xl border-2 border-[#c27d58] bg-[#fff5eb]/95 px-2.5 py-1.5 text-xs font-extrabold text-[#7c2d12] shadow-md hover:bg-[#ffedd5] disabled:cursor-not-allowed disabled:opacity-50"
         >
-          مزرعة جديدة
+          {isResetting ? 'جارٍ إعادة الضبط...' : 'مزرعة جديدة'}
         </button>
 
         {!isLocalPreview && userEmail && (

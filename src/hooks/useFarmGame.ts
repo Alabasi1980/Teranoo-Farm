@@ -9,47 +9,40 @@ import type { CropId } from '../content/crops';
 import { auth, googleProvider, testFirestoreConnection } from '../firebase/config';
 import {
   clearPendingLocalSnapshot,
+  clearPendingLocalSnapshotIfMatching,
   fetchServerFarm,
+  flushCloudSave,
   loadOrCreateCloudFarm,
+  rebasePendingLocalSnapshot,
   saveCloudFarmWithRevisionCheck,
   savePendingLocalSnapshot,
 } from '../firebase/farmRepository';
-import { RevisionConflictError } from '../firebase/syncLogic';
+import {
+  type ConflictState,
+  type CoordinatorSnapshot,
+  FarmSyncCoordinator,
+  type ScreenMode,
+} from '../firebase/syncCoordinator';
 import {
   buySeeds,
-  createInitialFarmState,
   evaluateRescueGrant,
   harvestPlot,
   plantPlot,
-  resetFarmState,
   sellCrops,
   waterPlot,
 } from '../game/rules';
-import type {
-  ActionOutcome,
-  FarmState,
-  PlotId,
-  SaveStatus,
-  ToolId,
-} from '../game/types';
+import type { ActionOutcome, PlotId, ToolId } from '../game/types';
 import { soundEngine } from '../audio/soundEffects';
 import type { BurstEvent } from '../scene/FarmEffects';
 import { getPlotPosition } from '../scene/FarmCanvas';
 
-export type ScreenMode = 'title' | 'loading_cloud' | 'playing';
+export type { ConflictState, ScreenMode };
 
 export interface ToastNotice {
   id: number;
   kind: 'info' | 'success' | 'warning' | 'error';
   text: string;
 }
-
-export interface ConflictState {
-  serverState: FarmState;
-  localState: FarmState;
-}
-
-const SAVE_DEBOUNCE_MS = 1100;
 
 export function useFarmGame() {
   const isAutostartPreview =
@@ -58,19 +51,6 @@ export function useFarmGame() {
 
   const [user, setUser] = useState<User | null>(null);
   const [authReady, setAuthReady] = useState(false);
-  const [screenMode, setScreenMode] = useState<ScreenMode>(
-    isAutostartPreview ? 'playing' : 'title',
-  );
-  const [isLocalPreview, setIsLocalPreview] = useState(isAutostartPreview);
-
-  const [farmState, setFarmState] = useState<FarmState>(() =>
-    createInitialFarmState('local-preview'),
-  );
-  const [saveStatus, setSaveStatus] = useState<SaveStatus>(
-    isAutostartPreview ? 'local_preview' : 'idle',
-  );
-  const [loadError, setLoadError] = useState<string | null>(null);
-  const [conflict, setConflict] = useState<ConflictState | null>(null);
 
   const [activeTool, setActiveTool] = useState<ToolId>('seed_wheat');
   const [selectedPlotId, setSelectedPlotId] = useState<PlotId | null>(null);
@@ -79,245 +59,101 @@ export function useFarmGame() {
   const [resetCameraSignal, setResetCameraSignal] = useState(0);
   const [latestBurst, setLatestBurst] = useState<BurstEvent | null>(null);
   const [toast, setToast] = useState<ToastNotice | null>(null);
-  const [lastSavedAtMs, setLastSavedAtMs] = useState<number | null>(null);
-
-  const farmStateRef = useRef(farmState);
-  farmStateRef.current = farmState;
-
-  const serverRevisionRef = useRef<number>(1);
-  const mutationSeqRef = useRef<number>(0);
-  const saveTimerRef = useRef<number | null>(null);
-  const isSavingRef = useRef(false);
-  const userRef = useRef<User | null>(null);
-  userRef.current = user;
 
   const showToast = useCallback((kind: ToastNotice['kind'], text: string) => {
     setToast({ id: Date.now() + Math.random(), kind, text });
   }, []);
 
+  const coordinatorRef = useRef<FarmSyncCoordinator | null>(null);
+  if (!coordinatorRef.current) {
+    coordinatorRef.current = new FarmSyncCoordinator({
+      isAutostartPreview,
+      cloud: {
+        testConnection: testFirestoreConnection,
+        loadOrCreateCloudFarm,
+        fetchServerFarm,
+        saveCloudFarmWithRevisionCheck,
+        flushCloudSave,
+      },
+      storage: {
+        savePending: savePendingLocalSnapshot,
+        clearPending: clearPendingLocalSnapshot,
+        clearIfMatching: clearPendingLocalSnapshotIfMatching,
+        rebasePending: rebasePendingLocalSnapshot,
+      },
+    });
+  }
+
+  const [syncSnapshot, setSyncSnapshot] = useState<CoordinatorSnapshot>(() =>
+    coordinatorRef.current!.getSnapshot(),
+  );
+
+  // Connect coordinator listener cleanly for React lifecycle
+  useEffect(() => {
+    const coord = new FarmSyncCoordinator({
+      isAutostartPreview,
+      cloud: {
+        testConnection: testFirestoreConnection,
+        loadOrCreateCloudFarm,
+        fetchServerFarm,
+        saveCloudFarmWithRevisionCheck,
+        flushCloudSave,
+      },
+      storage: {
+        savePending: savePendingLocalSnapshot,
+        clearPending: clearPendingLocalSnapshot,
+        clearIfMatching: clearPendingLocalSnapshotIfMatching,
+        rebasePending: rebasePendingLocalSnapshot,
+      },
+      onStateChange: (nextSnap) => {
+        setSyncSnapshot(nextSnap);
+      },
+      onToast: (notice) => {
+        showToast(notice.kind, notice.text);
+      },
+    });
+    coordinatorRef.current = coord;
+    setSyncSnapshot(coord.getSnapshot());
+
+    return () => {
+      coord.dispose();
+    };
+  }, [isAutostartPreview, showToast]);
+
   // Keep body data-state synced for accessibility & automation
   useEffect(() => {
-    document.body.dataset.state = screenMode === 'title' ? 'title' : 'playing';
-  }, [screenMode]);
+    document.body.dataset.state = syncSnapshot.screenMode === 'title' ? 'title' : 'playing';
+  }, [syncSnapshot.screenMode]);
 
   // Live growth timer tick (1Hz, UI & growth progression only — never writes to Firestore)
   useEffect(() => {
-    if (screenMode !== 'playing') return;
+    if (syncSnapshot.screenMode !== 'playing') return;
     const timer = window.setInterval(() => {
       setNowMs(Date.now());
     }, 1000);
     return () => window.clearInterval(timer);
-  }, [screenMode]);
+  }, [syncSnapshot.screenMode]);
 
-  // Clear pending timer on unmount
-  useEffect(() => {
-    return () => {
-      if (saveTimerRef.current !== null) {
-        window.clearTimeout(saveTimerRef.current);
-      }
-    };
-  }, []);
-
-  const flushCloudSave = useCallback(async () => {
-    const activeUser = userRef.current;
-    if (!activeUser || isLocalPreview) return;
-    if (isSavingRef.current) return;
-    if (conflict) return;
-
-    if (typeof navigator !== 'undefined' && !navigator.onLine) {
-      setSaveStatus('pending_offline');
-      return;
-    }
-
-    isSavingRef.current = true;
-    setSaveStatus('saving');
-    const seqAtStart = mutationSeqRef.current;
-    const snapshotToSave = farmStateRef.current;
-
-    try {
-      const saved = await saveCloudFarmWithRevisionCheck(
-        activeUser.uid,
-        snapshotToSave,
-        serverRevisionRef.current,
-      );
-      serverRevisionRef.current = saved.revision;
-      setLastSavedAtMs(saved.updatedAtMs);
-
-      // Update revision in state without clobbering newer local edits if any arrived during flight
-      setFarmState((prev) => ({
-        ...prev,
-        revision: saved.revision,
-        updatedAtMs: saved.updatedAtMs,
-      }));
-
-      if (mutationSeqRef.current !== seqAtStart) {
-        // More mutations occurred while saving; schedule follow-up flush
-        isSavingRef.current = false;
-        setSaveStatus('saving');
-        saveTimerRef.current = window.setTimeout(() => {
-          void flushCloudSave();
-        }, 450);
-        return;
-      }
-
-      setSaveStatus('saved');
-    } catch (error) {
-      if (error instanceof RevisionConflictError) {
-        setSaveStatus('conflict');
-        setConflict({
-          serverState: error.serverState,
-          localState: snapshotToSave,
-        });
-        showToast(
-          'warning',
-          'تم اكتشاف نسخة أحدث من مزرعتك على الخادم. أوقفنا الحفظ القديم لحماية تقدمك.',
-        );
-      } else {
-        const offline = typeof navigator !== 'undefined' && !navigator.onLine;
-        setSaveStatus(offline ? 'pending_offline' : 'error');
-        showToast(
-          'error',
-          offline
-            ? 'أنت غير متصل حاليًا؛ تم حفظ التعديلات محليًا وستتم المزامنة عند عودة الاتصال.'
-            : 'تعذر الحفظ إلى السحابة. التغييرات محفوظة محليًا ويمكنك إعادة المحاولة.',
-        );
-      }
-    } finally {
-      isSavingRef.current = false;
-    }
-  }, [conflict, isLocalPreview, showToast]);
-
-  const scheduleCloudSave = useCallback(
-    (nextState: FarmState) => {
-      if (isLocalPreview || !userRef.current) return;
-      mutationSeqRef.current += 1;
-
-      savePendingLocalSnapshot({
-        uid: userRef.current.uid,
-        baseRevision: serverRevisionRef.current,
-        state: nextState,
-        queuedAtMs: Date.now(),
-      });
-
-      if (typeof navigator !== 'undefined' && !navigator.onLine) {
-        setSaveStatus('pending_offline');
-        return;
-      }
-
-      setSaveStatus('saving');
-      if (saveTimerRef.current !== null) {
-        window.clearTimeout(saveTimerRef.current);
-      }
-      saveTimerRef.current = window.setTimeout(() => {
-        saveTimerRef.current = null;
-        void flushCloudSave();
-      }, SAVE_DEBOUNCE_MS);
-    },
-    [flushCloudSave, isLocalPreview],
-  );
-
-  const loadUserCloudFarm = useCallback(
-    async (firebaseUser: User) => {
-      setScreenMode('loading_cloud');
-      setSaveStatus('loading');
-      setLoadError(null);
-      setConflict(null);
-
-      try {
-        const conn = await testFirestoreConnection();
-        if (!conn.reachable) {
-          throw new Error('تعذر الاتصال بخدمة Cloud Firestore. تحقق من اتصالك بالإنترنت.');
-        }
-
-        const { resolution, createdInitial } = await loadOrCreateCloudFarm(firebaseUser.uid);
-
-        if (resolution.kind === 'use_server') {
-          const rescueCheck = evaluateRescueGrant(resolution.state);
-          serverRevisionRef.current = resolution.state.revision;
-          setFarmState(rescueCheck.state);
-          setLastSavedAtMs(resolution.state.updatedAtMs);
-          setSaveStatus('saved');
-          setScreenMode('playing');
-          if (rescueCheck.granted) {
-            scheduleCloudSave(rescueCheck.state);
-            showToast('info', 'تم منحك 3 بذور قمح إنقاذية لتتمكن من مواصلة الزراعة!');
-          } else if (createdInitial) {
-            showToast('success', 'أهلًا بك في مزرعتك الجديدة! تم إنشاء حفظك السحابي.');
-          }
-        } else if (resolution.kind === 'retry_pending') {
-          serverRevisionRef.current = resolution.baseRevision;
-          setFarmState(resolution.state);
-          setSaveStatus('pending_offline');
-          setScreenMode('playing');
-          showToast('info', 'تم العثور على تعديلات محلية غير متزامنة، جارٍ رفعها الآن...');
-          void flushCloudSave();
-        } else if (resolution.kind === 'conflict') {
-          serverRevisionRef.current = resolution.serverState.revision;
-          setFarmState(resolution.pendingState);
-          setSaveStatus('conflict');
-          setConflict({
-            serverState: resolution.serverState,
-            localState: resolution.pendingState,
-          });
-          setScreenMode('playing');
-        }
-      } catch (error) {
-        const rawMessage =
-          error instanceof Error
-            ? error.message
-            : 'حدث خطأ غير متوقع أثناء تحميل بيانات المزرعة.';
-        let userMessage = rawMessage;
-        if (rawMessage.includes('Quota exceeded')) {
-          userMessage =
-            'تم بلوغ حد الاستخدام اليومي المجاني لقاعدة البيانات. يُعاد ضبط الحصة تلقائيًا في اليوم التالي.';
-        } else if (
-          rawMessage.includes('Missing or insufficient permissions') ||
-          rawMessage.includes('permission-denied')
-        ) {
-          userMessage =
-            'تعذر الوصول إلى حفظ المزرعة بسبب صلاحيات قاعدة البيانات. يرجى المحاولة مجددًا بعد التأكد من تفعيل حساب Google وبريده الموثق.';
-        }
-        setLoadError(userMessage);
-        setSaveStatus('error');
-      }
-    },
-    [flushCloudSave, scheduleCloudSave, showToast],
-  );
-
-  // Firebase Auth listener
+  // Subscribe once to Firebase Auth — never re-subscribes when conflict/preview/saveStatus change.
   useEffect(() => {
     const unsub = onAuthStateChanged(auth, (nextUser) => {
       setUser(nextUser);
       setAuthReady(true);
-
-      if (nextUser) {
-        setIsLocalPreview(false);
-        void loadUserCloudFarm(nextUser);
-      } else if (!isAutostartPreview) {
-        setScreenMode('title');
-        setSaveStatus('idle');
-        setConflict(null);
-        setLoadError(null);
-      }
+      void coordinatorRef.current?.handleAuthChange(nextUser?.uid ?? null);
     });
     return () => unsub();
-  }, [isAutostartPreview, loadUserCloudFarm]);
+  }, []);
 
   // Retry pending saves automatically when browser comes back online
   useEffect(() => {
     const handleOnline = () => {
-      if (userRef.current && !isLocalPreview && !conflict) {
-        if (saveStatus === 'pending_offline' || saveStatus === 'error') {
-          void flushCloudSave();
-        }
-      }
+      void coordinatorRef.current?.handleBrowserOnline();
     };
     window.addEventListener('online', handleOnline);
     return () => window.removeEventListener('online', handleOnline);
-  }, [conflict, flushCloudSave, isLocalPreview, saveStatus]);
+  }, []);
 
   const signInWithGoogle = useCallback(async () => {
-    setLoadError(null);
     try {
       await signInWithPopup(auth, googleProvider);
     } catch (error) {
@@ -331,57 +167,30 @@ export function useFarmGame() {
   }, [showToast]);
 
   const handleSignOut = useCallback(async () => {
-    if (saveTimerRef.current !== null) {
-      window.clearTimeout(saveTimerRef.current);
-      saveTimerRef.current = null;
-    }
     await signOut(auth);
     setSelectedPlotId(null);
-    setConflict(null);
-    setScreenMode('title');
-    setSaveStatus('idle');
   }, []);
 
   const retryLoadCloudFarm = useCallback(() => {
-    if (userRef.current) {
-      void loadUserCloudFarm(userRef.current);
-    }
-  }, [loadUserCloudFarm]);
+    void coordinatorRef.current?.retryLoad();
+  }, []);
 
   const retryCloudSave = useCallback(() => {
-    void flushCloudSave();
-  }, [flushCloudSave]);
+    void coordinatorRef.current?.flushNow();
+  }, []);
 
   const resolveConflictUseServer = useCallback(async () => {
-    const activeUser = userRef.current;
-    if (!activeUser) return;
-    if (saveTimerRef.current !== null) {
-      window.clearTimeout(saveTimerRef.current);
-      saveTimerRef.current = null;
-    }
-    setSaveStatus('loading');
-    try {
-      const latestServer = await fetchServerFarm(activeUser.uid);
-      if (latestServer) {
-        clearPendingLocalSnapshot(activeUser.uid);
-        serverRevisionRef.current = latestServer.revision;
-        setFarmState(latestServer);
-        setLastSavedAtMs(latestServer.updatedAtMs);
-        setConflict(null);
-        setSaveStatus('saved');
-        showToast('success', 'تم تحميل أحدث نسخة محفوظة من السحابة بنجاح.');
-      }
-    } catch {
-      setSaveStatus('error');
-      showToast('error', 'تعذر تحميل النسخة الأحدث. تحقق من الاتصال وحاول مجددًا.');
-    }
-  }, [showToast]);
+    await coordinatorRef.current?.resolveConflictUseServer();
+  }, []);
 
   const applyOutcome = useCallback(
     (
       outcome: ActionOutcome,
       burst?: { plotId: PlotId; kind: BurstEvent['kind'] },
     ): boolean => {
+      const coord = coordinatorRef.current;
+      if (!coord || !coord.canAcceptGameplayAction()) return false;
+
       if (!outcome.ok) {
         soundEngine.playError();
         showToast('warning', outcome.messageAr);
@@ -390,9 +199,8 @@ export function useFarmGame() {
 
       const rescue = evaluateRescueGrant(outcome.state);
       const finalState = rescue.state;
-      setFarmState(finalState);
+      coord.recordGameplayMutation(finalState);
       setNowMs(Date.now());
-      scheduleCloudSave(finalState);
 
       if (burst) {
         const [x, , z] = getPlotPosition(burst.plotId);
@@ -409,17 +217,18 @@ export function useFarmGame() {
       }
       return true;
     },
-    [scheduleCloudSave, showToast],
+    [showToast],
   );
 
   const handlePlotAction = useCallback(
     (plotId: PlotId, toolOverride?: ToolId) => {
+      const coord = coordinatorRef.current;
       setSelectedPlotId(plotId);
-      if (conflict || screenMode !== 'playing') return;
+      if (!coord || !coord.canAcceptGameplayAction()) return;
 
       const tool = toolOverride ?? activeTool;
       const now = Date.now();
-      const current = farmStateRef.current;
+      const current = coord.getSnapshot().farmState;
 
       if (tool === 'seed_wheat' || tool === 'seed_carrot') {
         const cropId: CropId = tool === 'seed_wheat' ? 'wheat' : 'carrot';
@@ -445,79 +254,40 @@ export function useFarmGame() {
         }
       }
     },
-    [activeTool, applyOutcome, conflict, screenMode],
+    [activeTool, applyOutcome],
   );
 
   const handleBuySeeds = useCallback(
     (cropId: CropId, quantity: number) => {
-      if (conflict || screenMode !== 'playing') return;
-      const outcome = buySeeds(farmStateRef.current, cropId, quantity, Date.now());
+      const coord = coordinatorRef.current;
+      if (!coord || !coord.canAcceptGameplayAction()) return;
+      const outcome = buySeeds(coord.getSnapshot().farmState, cropId, quantity, Date.now());
       if (applyOutcome(outcome)) {
         soundEngine.playCoin();
       }
     },
-    [applyOutcome, conflict, screenMode],
+    [applyOutcome],
   );
 
   const handleSellCrops = useCallback(
     (cropId: CropId, quantity: number) => {
-      if (conflict || screenMode !== 'playing') return;
-      const outcome = sellCrops(farmStateRef.current, cropId, quantity, Date.now());
+      const coord = coordinatorRef.current;
+      if (!coord || !coord.canAcceptGameplayAction()) return;
+      const outcome = sellCrops(coord.getSnapshot().farmState, cropId, quantity, Date.now());
       if (applyOutcome(outcome)) {
         soundEngine.playCoin();
       }
     },
-    [applyOutcome, conflict, screenMode],
+    [applyOutcome],
   );
 
   const confirmNewFarm = useCallback(async () => {
-    if (saveTimerRef.current !== null) {
-      window.clearTimeout(saveTimerRef.current);
-      saveTimerRef.current = null;
-    }
-
-    const fresh = resetFarmState(farmStateRef.current, Date.now());
-    setFarmState(fresh);
+    const coord = coordinatorRef.current;
+    if (!coord || !coord.canAcceptGameplayAction()) return;
     setSelectedPlotId(null);
     setNowMs(Date.now());
-
-    if (isLocalPreview || !userRef.current) {
-      showToast('success', 'تمت إعادة بدء المزرعة بنجاح.');
-      return;
-    }
-
-    const activeUser = userRef.current;
-    setSaveStatus('saving');
-    try {
-      const saved = await saveCloudFarmWithRevisionCheck(
-        activeUser.uid,
-        fresh,
-        serverRevisionRef.current,
-      );
-      serverRevisionRef.current = saved.revision;
-      setFarmState(saved);
-      setLastSavedAtMs(saved.updatedAtMs);
-      setSaveStatus('saved');
-      showToast('success', 'تمت إعادة بدء مزرعتك وحفظها في السحابة.');
-    } catch (error) {
-      if (error instanceof RevisionConflictError) {
-        setSaveStatus('conflict');
-        setConflict({
-          serverState: error.serverState,
-          localState: fresh,
-        });
-      } else {
-        savePendingLocalSnapshot({
-          uid: activeUser.uid,
-          baseRevision: serverRevisionRef.current,
-          state: fresh,
-          queuedAtMs: Date.now(),
-        });
-        setSaveStatus('error');
-        showToast('error', 'أُعيد ضبط المزرعة محليًا، وتعذر الرفع للسحابة حاليًا.');
-      }
-    }
-  }, [isLocalPreview, showToast]);
+    await coord.confirmNewFarm();
+  }, []);
 
   const toggleMute = useCallback(() => {
     setMuted((prev) => {
@@ -534,12 +304,15 @@ export function useFarmGame() {
   return {
     user,
     authReady,
-    screenMode,
-    isLocalPreview,
-    farmState,
-    saveStatus,
-    loadError,
-    conflict,
+    screenMode: syncSnapshot.screenMode,
+    isLocalPreview: syncSnapshot.isLocalPreview,
+    farmState: syncSnapshot.farmState,
+    saveStatus: syncSnapshot.saveStatus,
+    loadError: syncSnapshot.loadError,
+    conflict: syncSnapshot.conflict,
+    isResetting: syncSnapshot.isResetting,
+    localPersistFailed: syncSnapshot.localPersistFailed,
+    cloudWriteVerified: syncSnapshot.cloudWriteVerified,
     activeTool,
     setActiveTool,
     selectedPlotId,
@@ -552,7 +325,7 @@ export function useFarmGame() {
     latestBurst,
     toast,
     dismissToast: () => setToast(null),
-    lastSavedAtMs,
+    lastSavedAtMs: syncSnapshot.lastSavedAtMs,
     signInWithGoogle,
     handleSignOut,
     retryLoadCloudFarm,

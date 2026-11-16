@@ -76,12 +76,19 @@ export default function App() {
             farmState={game.farmState}
             saveStatus={game.saveStatus}
             isLocalPreview={game.isLocalPreview}
+            isResetting={game.isResetting}
+            localPersistFailed={game.localPersistFailed}
+            hasConflict={Boolean(game.conflict)}
             userEmail={game.user?.email ?? null}
             muted={game.muted}
             lastSavedAtMs={game.lastSavedAtMs}
             onToggleMute={game.toggleMute}
             onResetCamera={game.resetCamera}
-            onRequestNewFarm={() => setConfirmResetOpen(true)}
+            onRequestNewFarm={() => {
+              if (!game.isResetting && !game.conflict) {
+                setConfirmResetOpen(true);
+              }
+            }}
             onRetrySave={game.retryCloudSave}
             onSignOut={game.handleSignOut}
           />
